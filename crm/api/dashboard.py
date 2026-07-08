@@ -242,8 +242,11 @@ def get_average_ongoing_deal_value(
 
 	result = query.run(as_dict=True)
 
-	current_month_avg_value = result[0].current_month_avg_value or 0
-	prev_month_avg_value = result[0].prev_month_avg_value or 0
+	current_month_avg_value = result[0].current_month_avg_value
+	prev_month_avg_value = result[0].prev_month_avg_value
+	is_empty = not current_month_avg_value
+	current_month_avg_value = current_month_avg_value or 0
+	prev_month_avg_value = prev_month_avg_value or 0
 
 	avg_value_delta = current_month_avg_value - prev_month_avg_value if prev_month_avg_value else 0
 
@@ -253,6 +256,8 @@ def get_average_ongoing_deal_value(
 		"value": current_month_avg_value,
 		"delta": avg_value_delta,
 		"prefix": get_base_currency_symbol(),
+		"isEmpty": is_empty,
+		"emptyReason": _("No ongoing deals with a value entered"),
 	}
 
 
@@ -355,8 +360,11 @@ def get_average_won_deal_value(
 
 	result = query.run(as_dict=True)
 
-	current_month_avg_value = result[0].current_month_avg_value or 0
-	prev_month_avg_value = result[0].prev_month_avg_value or 0
+	current_month_avg_value = result[0].current_month_avg_value
+	prev_month_avg_value = result[0].prev_month_avg_value
+	is_empty = not current_month_avg_value
+	current_month_avg_value = current_month_avg_value or 0
+	prev_month_avg_value = prev_month_avg_value or 0
 
 	avg_value_delta = current_month_avg_value - prev_month_avg_value if prev_month_avg_value else 0
 
@@ -366,6 +374,8 @@ def get_average_won_deal_value(
 		"value": current_month_avg_value,
 		"delta": avg_value_delta,
 		"prefix": get_base_currency_symbol(),
+		"isEmpty": is_empty,
+		"emptyReason": _("No won deals with a deal value entered in this period"),
 	}
 
 
@@ -409,8 +419,11 @@ def get_average_deal_value(from_date: str | None = None, to_date: str | None = N
 
 	result = query.run(as_dict=True)
 
-	current_month_avg = result[0].current_month_avg or 0
-	prev_month_avg = result[0].prev_month_avg or 0
+	current_month_avg = result[0].current_month_avg
+	prev_month_avg = result[0].prev_month_avg
+	is_empty = not current_month_avg
+	current_month_avg = current_month_avg or 0
+	prev_month_avg = prev_month_avg or 0
 
 	delta = current_month_avg - prev_month_avg if prev_month_avg else 0
 
@@ -421,6 +434,8 @@ def get_average_deal_value(from_date: str | None = None, to_date: str | None = N
 		"prefix": get_base_currency_symbol(),
 		"delta": delta,
 		"deltaSuffix": "%",
+		"isEmpty": is_empty,
+		"emptyReason": _("No non-lost deals with a value entered in this period"),
 	}
 
 
@@ -428,7 +443,12 @@ def get_average_time_to_close_a_lead(
 	from_date: str | None = None, to_date: str | None = None, user: str | None = None
 ):
 	"""
-	Get average time to close deals for the dashboard.
+	Get average time from lead creation to deal closure for the dashboard.
+
+	Only counts won deals that were sourced from a linked CRM Lead. Without this
+	restriction, deals created directly (without a linked lead) fall through the
+	COALESCE and reduce this metric to `get_average_time_to_close_a_deal`, making
+	the two indistinguishable.
 	"""
 	diff = frappe.utils.date_diff(to_date, from_date)
 	if diff == 0:
@@ -442,8 +462,13 @@ def get_average_time_to_close_a_lead(
 	Status = DocType("CRM Deal Status")
 	Lead = DocType("CRM Lead")
 
-	# Base condition: closed_date is not null and status type is Won
-	base_cond = (Deal.closed_date.isnotnull()) & (Status.type == "Won")
+	# Base condition: won deal with a resolvable closed_date AND a linked lead.
+	base_cond = (
+		Deal.closed_date.isnotnull()
+		& (Status.type == "Won")
+		& Deal.lead.isnotnull()
+		& (Deal.lead != "")
+	)
 	if user:
 		base_cond = base_cond & (Deal.deal_owner == user)
 
@@ -453,17 +478,15 @@ def get_average_time_to_close_a_lead(
 	# Previous period condition
 	prev_cond = (Deal.closed_date >= prev_from_date) & (Deal.closed_date < prev_to_date)
 
-	# Calculate time difference from lead/deal creation to deal closure
 	time_diff = TimestampDiff(
-		frappe.qb.terms.LiteralValue("DAY"), Coalesce(Lead.creation, Deal.creation), Deal.closed_date
+		frappe.qb.terms.LiteralValue("DAY"), Lead.creation, Deal.closed_date
 	)
 
-	# Build query
 	query = (
 		frappe.qb.from_(Deal)
 		.join(Status)
 		.on(Deal.status == Status.name)
-		.left_join(Lead)
+		.join(Lead)  # inner join — the base_cond already requires a lead link
 		.on(Deal.lead == Lead.name)
 		.where(base_cond)
 		.select(
@@ -474,18 +497,23 @@ def get_average_time_to_close_a_lead(
 
 	result = query.run(as_dict=True)
 
-	current_avg_lead = result[0].current_avg_lead or 0
-	prev_avg_lead = result[0].prev_avg_lead or 0
+	current_avg_lead = result[0].current_avg_lead
+	prev_avg_lead = result[0].prev_avg_lead
+	is_empty = current_avg_lead is None
+	current_avg_lead = current_avg_lead or 0
+	prev_avg_lead = prev_avg_lead or 0
 	delta_lead = current_avg_lead - prev_avg_lead if prev_avg_lead else 0
 
 	return {
 		"title": _("Avg. time to close a lead"),
-		"tooltip": _("Average time taken from lead creation to deal closure"),
+		"tooltip": _("Average time from lead creation to deal closure (only deals linked to a lead)"),
 		"value": current_avg_lead,
 		"suffix": " days",
 		"delta": delta_lead,
 		"deltaSuffix": " days",
 		"negativeIsBetter": True,
+		"isEmpty": is_empty,
+		"emptyReason": _("No lead-sourced won deals in this period"),
 	}
 
 
@@ -537,8 +565,11 @@ def get_average_time_to_close_a_deal(
 
 	result = query.run(as_dict=True)
 
-	current_avg_deal = result[0].current_avg_deal or 0
-	prev_avg_deal = result[0].prev_avg_deal or 0
+	current_avg_deal = result[0].current_avg_deal
+	prev_avg_deal = result[0].prev_avg_deal
+	is_empty = current_avg_deal is None
+	current_avg_deal = current_avg_deal or 0
+	prev_avg_deal = prev_avg_deal or 0
 	delta_deal = current_avg_deal - prev_avg_deal if prev_avg_deal else 0
 
 	return {
@@ -549,6 +580,8 @@ def get_average_time_to_close_a_deal(
 		"delta": delta_deal,
 		"deltaSuffix": " days",
 		"negativeIsBetter": True,
+		"isEmpty": is_empty,
+		"emptyReason": _("No won deals in this period"),
 	}
 
 
@@ -1103,6 +1136,10 @@ def get_deals_by_salesperson(
 	CRMDeal = DocType("CRM Deal")
 	User = DocType("User")
 
+	# Filter by `modified` (any activity in the window) rather than `creation`. A "deals by
+	# salesperson" chart should represent workload in the period, not just newly-created deals —
+	# otherwise salespeople whose deals were opened before the window disappear entirely, even
+	# when they moved those deals through stages during the window.
 	query = (
 		frappe.qb.from_(CRMDeal)
 		.left_join(User)
@@ -1112,7 +1149,8 @@ def get_deals_by_salesperson(
 			Count("*").as_("deals"),
 			Sum(Coalesce(CRMDeal.deal_value, 0) * IfNull(CRMDeal.exchange_rate, 1)).as_("value"),
 		)
-		.where(Date(CRMDeal.creation).between(from_date, to_date))
+		.where(Date(CRMDeal.modified).between(from_date, to_date))
+		.where(CRMDeal.deal_owner.isnotnull() & (CRMDeal.deal_owner != ""))
 		.groupby(CRMDeal.deal_owner)
 		.orderby(Count("*"), order=frappe.qb.desc)
 		.orderby(
