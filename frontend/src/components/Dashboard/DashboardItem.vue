@@ -4,13 +4,24 @@
       v-if="item.type == 'number_chart'"
       class="flex h-full w-full rounded shadow overflow-hidden cursor-pointer"
     >
-      <Tooltip :text="__(item.data.tooltip)">
+      <Tooltip :text="__(item.data?.isEmpty ? item.data.emptyReason : item.data?.tooltip)">
         <NumberChart
           v-if="item.data"
           :key="index"
           class="!items-start"
           :config="item.data"
-        />
+        >
+          <template v-if="item.data.isEmpty" #subtitle>
+            <div
+              class="flex flex-1 items-center gap-0.5 flex-shrink-0 truncate text-[24px] text-ink-gray-4 font-semibold leading-10"
+            >
+              —
+            </div>
+          </template>
+          <template v-if="item.data.isEmpty" #delta>
+            <div />
+          </template>
+        </NumberChart>
       </Tooltip>
     </div>
     <div
