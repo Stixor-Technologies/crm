@@ -1571,6 +1571,358 @@ def get_data_quality(
 	}
 
 
+def get_aging_deals(
+	from_date: str | None = None, to_date: str | None = None, user: str | None = None
+):
+	"""
+	Deals that have been sitting in their current non-terminal stage for too long.
+
+	"Too long" = the current stage entry is > 30 days old. Ignores from_date/to_date
+	on purpose — aging is a *current pipeline health* metric, not a period snapshot.
+	The user filter still applies.
+
+	Bars are per salesperson, grouped into 30-60 / 60-90 / 90+ day buckets so a
+	manager can see who has the worst pile-up and how bad it is (a chart with a
+	single bar per person would flag "5 stalled" as no different from "5 stalled
+	for 6 months").
+	"""
+	Deal = DocType("CRM Deal")
+	Status = DocType("CRM Deal Status")
+	Log = DocType("CRM Status Change Log")
+	User = DocType("User")
+
+	# Days spent in the current stage. `to_date` may be NULL or empty string
+	# depending on how the row was written, so guard both.
+	days_in_stage = TimestampDiff(
+		frappe.qb.terms.LiteralValue("DAY"), Log.from_date, frappe.qb.terms.LiteralValue("NOW()")
+	)
+
+	current_log_cond = (
+		Log.parenttype == "CRM Deal"
+	) & (
+		Log.to_date.isnull() | (Log.to_date == "")
+	)
+
+	base_query = (
+		frappe.qb.from_(Deal)
+		.join(Status)
+		.on(Deal.status == Status.name)
+		.join(Log)
+		.on((Log.parent == Deal.name) & current_log_cond)
+		.left_join(User)
+		.on(User.name == Deal.deal_owner)
+		.where(Status.type.isin(["Open", "Ongoing"]))
+		.where(Deal.deal_owner.isnotnull() & (Deal.deal_owner != ""))
+		.where(days_in_stage > 30)
+	)
+	if user:
+		base_query = base_query.where(Deal.deal_owner == user)
+
+	query = base_query.select(
+		IfNull(User.full_name, Deal.deal_owner).as_("salesperson"),
+		Sum(Case().when((days_in_stage > 30) & (days_in_stage <= 60), 1).else_(0)).as_("d30_60"),
+		Sum(Case().when((days_in_stage > 60) & (days_in_stage <= 90), 1).else_(0)).as_("d60_90"),
+		Sum(Case().when(days_in_stage > 90, 1).else_(0)).as_("d90_plus"),
+	).groupby(Deal.deal_owner).orderby(
+		Sum(Case().when(days_in_stage > 90, 1).else_(0)), order=frappe.qb.desc
+	)
+
+	rows = query.run(as_dict=True) or []
+
+	# Normalize types (SUM(CASE) can come back as Decimal).
+	for r in rows:
+		r["d30_60"] = int(r["d30_60"] or 0)
+		r["d60_90"] = int(r["d60_90"] or 0)
+		r["d90_plus"] = int(r["d90_plus"] or 0)
+
+	return {
+		"data": rows,
+		"title": _("Aging deals"),
+		"subtitle": _("Non-terminal deals stuck in their current stage (30+ days)"),
+		"xAxis": {
+			"title": _("Salesperson"),
+			"key": "salesperson",
+			"type": "category",
+		},
+		"yAxis": {
+			"title": _("Deals stuck"),
+		},
+		"series": [
+			{"name": "d30_60", "type": "bar", "stack": "aging"},
+			{"name": "d60_90", "type": "bar", "stack": "aging"},
+			{"name": "d90_plus", "type": "bar", "stack": "aging"},
+		],
+	}
+
+
+def get_time_in_stage(
+	from_date: str | None = None, to_date: str | None = None, user: str | None = None
+):
+	"""
+	Average days each stage retains a deal before it moves out.
+
+	Uses the CRM Status Change Log's completed transitions (where the deal has
+	already moved out of the stage) so the number represents settled behavior
+	rather than in-flight time. All-time — the goal is a stable baseline of your
+	sales process, and windowing produces jitter.
+
+	Uses raw SQL because the log's `from` column collides with pypika's reserved
+	keyword handling.
+	"""
+	user_join = "JOIN `tabCRM Deal` d ON d.name = l.parent"
+	user_where = ""
+	params: dict[str, str] = {}
+	if user:
+		user_where = "AND d.deal_owner = %(user)s"
+		params["user"] = user
+
+	rows = frappe.db.sql(
+		f"""
+		SELECT
+			l.`from` AS stage,
+			IFNULL(s.type, '') AS stage_type,
+			ROUND(AVG(l.duration) / 86400.0, 1) AS avg_days,
+			COUNT(*) AS transitions
+		FROM `tabCRM Status Change Log` l
+		{user_join}
+		LEFT JOIN `tabCRM Deal Status` s ON s.name = l.`from`
+		WHERE l.parenttype = 'CRM Deal'
+		  AND l.to_date IS NOT NULL AND l.to_date != ''
+		  AND l.duration > 0
+		  {user_where}
+		GROUP BY l.`from`, s.type, s.position
+		ORDER BY s.position
+		""",
+		params,
+		as_dict=True,
+	) or []
+	for r in rows:
+		r["avg_days"] = float(r["avg_days"] or 0)
+		r["transitions"] = int(r["transitions"] or 0)
+
+	return {
+		"data": rows,
+		"title": _("Average time in stage"),
+		"subtitle": _("Days a deal spends in each stage before moving out"),
+		"xAxis": {
+			"title": _("Stage"),
+			"key": "stage",
+			"type": "category",
+		},
+		"yAxis": {
+			"title": _("Avg days"),
+		},
+		"series": [
+			{"name": "avg_days", "type": "bar"},
+		],
+	}
+
+
+def get_pipeline_value_by_stage(
+	from_date: str | None = None, to_date: str | None = None, user: str | None = None
+):
+	"""
+	Current pipeline value, per stage, weighted by stage probability.
+
+	Non-terminal stages only (Won and Lost aren't pipeline anymore). Each deal's
+	contribution is `expected_deal_value * probability / 100`, converted to base
+	currency via the deal's own exchange_rate. Weighting acknowledges that a
+	Qualification-stage deal at 10% doesn't count as much as a Ready-to-Close
+	deal at 90%.
+
+	Ignores from_date/to_date — pipeline is a snapshot of the current state, not
+	of what was created in a window.
+	"""
+	Deal = DocType("CRM Deal")
+	Status = DocType("CRM Deal Status")
+
+	value_expr = (
+		Coalesce(Deal.expected_deal_value, 0)
+		* Coalesce(Deal.probability, 0)
+		/ 100
+		* IfNull(Deal.exchange_rate, 1)
+	)
+
+	query = (
+		frappe.qb.from_(Deal)
+		.join(Status)
+		.on(Deal.status == Status.name)
+		.where(Status.type.isin(["Open", "Ongoing"]))
+		.select(
+			Status.name.as_("stage"),
+			Count("*").as_("deals"),
+			Sum(value_expr).as_("value"),
+		)
+		.groupby(Status.name, Status.position)
+		.orderby(Status.position)
+	)
+	if user:
+		query = query.where(Deal.deal_owner == user)
+
+	rows = query.run(as_dict=True) or []
+	for r in rows:
+		r["deals"] = int(r["deals"] or 0)
+		r["value"] = float(r["value"] or 0)
+
+	return {
+		"data": rows,
+		"title": _("Pipeline value by stage"),
+		"subtitle": _("Expected value weighted by stage probability"),
+		"xAxis": {
+			"title": _("Stage"),
+			"key": "stage",
+			"type": "category",
+		},
+		"yAxis": {
+			"title": _("Weighted value") + f" ({get_base_currency_symbol()})",
+		},
+		"y2Axis": {
+			"title": _("Deals"),
+		},
+		"series": [
+			{"name": "value", "type": "bar"},
+			{"name": "deals", "type": "line", "showDataPoints": True, "axis": "y2"},
+		],
+	}
+
+
+def get_sales_velocity(
+	from_date: str | None = None, to_date: str | None = None, user: str | None = None
+):
+	"""
+	Won deals per month + won value per month, over the last 12 months.
+
+	Ignores from_date/to_date — velocity is a trend metric; a window of "last 30
+	days" would produce a single bar. Consistent with the other trend charts
+	(win_rate_trend, forecasted_revenue).
+	"""
+	Deal = DocType("CRM Deal")
+	Status = DocType("CRM Deal Status")
+
+	twelve_months_ago = frappe.utils.add_months(frappe.utils.nowdate(), -12)
+
+	value_expr = Coalesce(Deal.deal_value, 0) * IfNull(Deal.exchange_rate, 1)
+
+	query = (
+		frappe.qb.from_(Deal)
+		.join(Status)
+		.on(Deal.status == Status.name)
+		.where(Status.type == "Won")
+		.where(Deal.closed_date.isnotnull())
+		.where(Deal.closed_date >= twelve_months_ago)
+		.select(
+			DateFormat(Deal.closed_date, "%Y-%m").as_("month"),
+			Count("*").as_("deals"),
+			Sum(value_expr).as_("value"),
+		)
+		.groupby(DateFormat(Deal.closed_date, "%Y-%m"))
+		.orderby(DateFormat(Deal.closed_date, "%Y-%m"))
+	)
+	if user:
+		query = query.where(Deal.deal_owner == user)
+
+	rows = query.run(as_dict=True) or []
+	for r in rows:
+		r["month"] = frappe.utils.get_datetime(r["month"]).strftime("%Y-%m-01")
+		r["deals"] = int(r["deals"] or 0)
+		r["value"] = float(r["value"] or 0)
+
+	return {
+		"data": rows,
+		"title": _("Sales velocity"),
+		"subtitle": _("Won deals and won value per month, last 12 months"),
+		"xAxis": {
+			"title": _("Month"),
+			"key": "month",
+			"type": "time",
+			"timeGrain": "month",
+		},
+		"yAxis": {
+			"title": _("Won deals"),
+		},
+		"y2Axis": {
+			"title": _("Won value") + f" ({get_base_currency_symbol()})",
+		},
+		"series": [
+			{"name": "deals", "type": "bar"},
+			{"name": "value", "type": "line", "showDataPoints": True, "axis": "y2"},
+		],
+	}
+
+
+def get_lost_reasons_by_value(
+	from_date: str | None = None, to_date: str | None = None, user: str | None = None
+):
+	"""
+	Lost deal reasons, weighted by deal value.
+
+	Companion to get_lost_deal_reasons — that chart shows *frequency*, this one
+	shows *cost*. A reason that only fires twice but on the two biggest deals of
+	the year matters more than one that fires ten times on trivial ones.
+
+	Uses deal_value where set, falling back to expected_deal_value. All-time,
+	same as the frequency chart, and same reasoning: pattern discovery, not a
+	period snapshot.
+	"""
+	Deal = DocType("CRM Deal")
+	Status = DocType("CRM Deal Status")
+
+	# Prefer deal_value (the closed amount) but fall back to expected — many lost
+	# deals are lost before deal_value gets touched, so expected_deal_value is what
+	# was on the table when the deal died.
+	value_expr = (
+		Coalesce(
+			frappe.qb.terms.Function("NULLIF", Deal.deal_value, 0),
+			Deal.expected_deal_value,
+			0,
+		)
+		* IfNull(Deal.exchange_rate, 1)
+	)
+
+	query = (
+		frappe.qb.from_(Deal)
+		.join(Status)
+		.on(Deal.status == Status.name)
+		.where(Status.type == "Lost")
+		.where(Deal.lost_reason.isnotnull() & (Deal.lost_reason != ""))
+		.select(
+			Deal.lost_reason.as_("reason"),
+			Count("*").as_("count"),
+			Sum(value_expr).as_("value"),
+		)
+		.groupby(Deal.lost_reason)
+		.orderby(Sum(value_expr), order=frappe.qb.desc)
+	)
+	if user:
+		query = query.where(Deal.deal_owner == user)
+
+	rows = query.run(as_dict=True) or []
+	for r in rows:
+		r["count"] = int(r["count"] or 0)
+		r["value"] = float(r["value"] or 0)
+
+	return {
+		"data": rows,
+		"title": _("Lost reasons by value"),
+		"subtitle": _("All-time — total lost pipeline value by reason"),
+		"xAxis": {
+			"title": _("Reason"),
+			"key": "reason",
+			"type": "category",
+		},
+		"yAxis": {
+			"title": _("Lost value") + f" ({get_base_currency_symbol()})",
+		},
+		"y2Axis": {
+			"title": _("Count"),
+		},
+		"series": [
+			{"name": "value", "type": "bar"},
+			{"name": "count", "type": "line", "showDataPoints": True, "axis": "y2"},
+		],
+	}
+
+
 def get_base_currency_symbol():
 	"""
 	Get the base currency symbol from the system settings.

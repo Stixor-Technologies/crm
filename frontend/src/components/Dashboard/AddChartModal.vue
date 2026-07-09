@@ -88,12 +88,17 @@ const numberCharts = [
 const axisChart = ref('sales_trend')
 const axisCharts = [
   { label: __('Sales Trend'), value: 'sales_trend' },
+  { label: __('Sales Velocity'), value: 'sales_velocity' },
   { label: __('Forecasted Revenue'), value: 'forecasted_revenue' },
+  { label: __('Pipeline Value by Stage'), value: 'pipeline_value_by_stage' },
   { label: __('Win Rate Over Time'), value: 'win_rate_trend' },
   { label: __('Data Quality'), value: 'data_quality' },
+  { label: __('Aging Deals'), value: 'aging_deals' },
+  { label: __('Average Time in Stage'), value: 'time_in_stage' },
   { label: __('Funnel Conversion'), value: 'funnel_conversion' },
   { label: __('Deals by Ongoing & Won Stage'), value: 'deals_by_stage_axis' },
   { label: __('Lost Deal Reasons'), value: 'lost_deal_reasons' },
+  { label: __('Lost Reasons by Value'), value: 'lost_reasons_by_value' },
   { label: __('Deals by Territory'), value: 'deals_by_territory' },
   { label: __('Deals by Salesperson'), value: 'deals_by_salesperson' },
 ]
