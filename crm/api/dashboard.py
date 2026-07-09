@@ -26,9 +26,11 @@ def _get_currency_context(target_currency: str | None = None) -> dict:
 	"""
 	Resolve the currency the dashboard should display in.
 
-	Returns {code, symbol, multiplier}, where `multiplier` converts a value already
-	normalized to the base currency (via each deal's stored `exchange_rate`) into the
-	target currency.
+	Returns {code, symbol, base_symbol, multiplier}, where `multiplier` converts a
+	value already normalized to the base currency (via each deal's stored
+	`exchange_rate`) into the target currency, and `base_symbol` is retained so the
+	response wrapper can rewrite axis labels of the form `Foo ({base_symbol})`
+	without touching unrelated parenthetical suffixes like `(%)` on a rate chart.
 
 	Rate resolution, in order:
 	  1. If target == base, multiplier is 1.
@@ -47,8 +49,10 @@ def _get_currency_context(target_currency: str | None = None) -> dict:
 
 	symbol_for = lambda code: frappe.db.get_value("Currency", code, "symbol") or code
 
+	base_symbol = symbol_for(base)
+
 	if target == base:
-		return {"code": base, "symbol": symbol_for(base), "multiplier": 1.0}
+		return {"code": base, "symbol": base_symbol, "base_symbol": base_symbol, "multiplier": 1.0}
 
 	rate: float | None = None
 
@@ -77,7 +81,12 @@ def _get_currency_context(target_currency: str | None = None) -> dict:
 	if not rate:
 		rate = 1.0
 
-	return {"code": target, "symbol": symbol_for(target), "multiplier": rate}
+	return {
+		"code": target,
+		"symbol": symbol_for(target),
+		"base_symbol": base_symbol,
+		"multiplier": rate,
+	}
 
 
 def _apply_currency(data: dict | list | None, ctx: dict) -> dict | list | None:
@@ -102,13 +111,17 @@ def _apply_currency(data: dict | list | None, ctx: dict) -> dict | list | None:
 	if isinstance(data.get("value"), int | float):
 		data["value"] = data["value"] * multiplier
 
-	# Only touch axis titles that already carry a "(symbol)" tail, and only the tail —
-	# leaves the axis label alone (e.g. "Revenue (₨)" -> "Revenue ($)").
-	title_currency_pattern = re.compile(r"\([^)]*\)$")
-	for axis in ("yAxis", "y2Axis"):
-		axis_conf = data.get(axis)
-		if isinstance(axis_conf, dict) and isinstance(axis_conf.get("title"), str):
-			axis_conf["title"] = title_currency_pattern.sub(f"({symbol})", axis_conf["title"])
+	# Only rewrite axis titles that carry the *base* currency symbol in parens — this
+	# leaves unrelated parenthetical suffixes (like "Win rate (%)") untouched. Charts
+	# emit their axis titles as `f"{label} ({get_base_currency_symbol()})"`, so if the
+	# symbol isn't in the title, the axis isn't currency-scaled and shouldn't be rewritten.
+	base_symbol = ctx.get("base_symbol") or ""
+	if base_symbol:
+		title_currency_pattern = re.compile(r"\(" + re.escape(base_symbol) + r"\)")
+		for axis in ("yAxis", "y2Axis"):
+			axis_conf = data.get(axis)
+			if isinstance(axis_conf, dict) and isinstance(axis_conf.get("title"), str):
+				axis_conf["title"] = title_currency_pattern.sub(f"({symbol})", axis_conf["title"])
 
 	rows = data.get("data")
 	if isinstance(rows, list):
@@ -1322,6 +1335,218 @@ def get_deals_by_salesperson(
 		"series": [
 			{"name": "deals", "type": "bar"},
 			{"name": "value", "type": "line", "showDataPoints": True, "axis": "y2"},
+		],
+	}
+
+
+def get_win_rate_trend(
+	from_date: str | None = None, to_date: str | None = None, user: str | None = None
+):
+	"""
+	Win rate over time: won / (won + lost) per month, over the last 12 months.
+
+	Ignores from_date/to_date on purpose — the window filters throughout the rest of
+	the dashboard drive current-period comparisons, but win rate is only meaningful
+	as a trend, so we hold a fixed 12-month rolling window. The other filters (user)
+	still apply.
+	"""
+	Deal = DocType("CRM Deal")
+	Status = DocType("CRM Deal Status")
+
+	twelve_months_ago = frappe.utils.add_months(frappe.utils.nowdate(), -12)
+
+	won_expr = Sum(Case().when(Status.type == "Won", 1).else_(0))
+	lost_expr = Sum(Case().when(Status.type == "Lost", 1).else_(0))
+
+	query = (
+		frappe.qb.from_(Deal)
+		.join(Status)
+		.on(Deal.status == Status.name)
+		.select(
+			DateFormat(Deal.closed_date, "%Y-%m").as_("month"),
+			won_expr.as_("won"),
+			lost_expr.as_("lost"),
+		)
+		.where(Deal.closed_date.isnotnull())
+		.where(Deal.closed_date >= twelve_months_ago)
+		.where(Status.type.isin(["Won", "Lost"]))
+		.groupby(DateFormat(Deal.closed_date, "%Y-%m"))
+		.orderby(DateFormat(Deal.closed_date, "%Y-%m"))
+	)
+
+	if user:
+		query = query.where(Deal.deal_owner == user)
+
+	rows = query.run(as_dict=True)
+
+	data = []
+	for row in rows:
+		won = int(row["won"] or 0)
+		lost = int(row["lost"] or 0)
+		closed = won + lost
+		# Skip months where nothing closed — a 0/0 point on the chart reads as "0%
+		# win rate" which is misleading; better to omit the month.
+		if closed == 0:
+			continue
+		data.append(
+			{
+				"month": frappe.utils.get_datetime(row["month"]).strftime("%Y-%m-01"),
+				"win_rate": round(100.0 * won / closed, 1),
+				"won": won,
+				"lost": lost,
+			}
+		)
+
+	return {
+		"data": data,
+		"title": _("Win rate over time"),
+		"subtitle": _("Won / (Won + Lost) closed deals per month, last 12 months"),
+		"xAxis": {
+			"title": _("Month"),
+			"key": "month",
+			"type": "time",
+			"timeGrain": "month",
+		},
+		"yAxis": {
+			"title": _("Win rate (%)"),
+		},
+		"series": [
+			{"name": "win_rate", "type": "line", "showDataPoints": True},
+		],
+	}
+
+
+def get_data_quality(
+	from_date: str | None = None, to_date: str | None = None, user: str | None = None
+):
+	"""
+	Data-quality snapshot: for each dashboard-relevant deal field, the percentage of
+	deals in the current window that have it populated.
+
+	Purpose is to make the reason behind empty tiles visible. E.g. Avg. Won Deal
+	Value at 0 could be zero because there are no won deals in the period, or
+	because won deals were closed without a `deal_value` — this chart tells you
+	which. Bar per field with % populated (0-100).
+	"""
+	if not from_date or not to_date:
+		from_date = frappe.utils.get_first_day(from_date or frappe.utils.nowdate())
+		to_date = frappe.utils.get_last_day(to_date or frappe.utils.nowdate())
+
+	to_date_plus_one = frappe.utils.add_days(to_date, 1)
+
+	Deal = DocType("CRM Deal")
+	Status = DocType("CRM Deal Status")
+
+	user_cond = (Deal.deal_owner == user) if user else None
+
+	def _run(where_extra=None):
+		"""Return (total, populated_field_counts) for deals matching the window."""
+		# Base filter: deals created in the current period (matches the rest of the dashboard).
+		q = (
+			frappe.qb.from_(Deal)
+			.join(Status)
+			.on(Deal.status == Status.name)
+			.where(Deal.creation >= from_date)
+			.where(Deal.creation < to_date_plus_one)
+		)
+		if user_cond is not None:
+			q = q.where(user_cond)
+		if where_extra is not None:
+			q = q.where(where_extra)
+		return q
+
+	def _totals():
+		q = _run().select(Count("*").as_("total"))
+		return int(q.run(as_dict=True)[0]["total"])
+
+	def _populated(cond, extra=None):
+		q = _run(extra).select(Sum(Case().when(cond, 1).else_(0)).as_("populated"))
+		return int(q.run(as_dict=True)[0]["populated"] or 0)
+
+	total_deals = _totals()
+
+	# Won deals need a separate denominator (deal_value is only meaningful post-close).
+	won_query = _run(Status.type == "Won").select(Count("*").as_("n"))
+	won_total = int(won_query.run(as_dict=True)[0]["n"])
+
+	def _pct(numer, denom):
+		return round(100.0 * numer / denom, 1) if denom else 0.0
+
+	fields = []
+
+	# Deal Value on Won deals — the field that drives Avg. Won Deal Value.
+	won_with_value = _populated(Deal.deal_value > 0, Status.type == "Won")
+	fields.append(
+		{
+			"field": _("Deal Value (Won only)"),
+			"populated_pct": _pct(won_with_value, won_total),
+			"populated": won_with_value,
+			"total": won_total,
+		}
+	)
+
+	# Expected Deal Value on non-lost deals (drives forecasted revenue + pipeline value).
+	non_lost = _run(Status.type != "Lost").select(Count("*").as_("n"))
+	non_lost_total = int(non_lost.run(as_dict=True)[0]["n"])
+	non_lost_with_expected = _populated(Deal.expected_deal_value > 0, Status.type != "Lost")
+	fields.append(
+		{
+			"field": _("Expected Deal Value (non-Lost)"),
+			"populated_pct": _pct(non_lost_with_expected, non_lost_total),
+			"populated": non_lost_with_expected,
+			"total": non_lost_total,
+		}
+	)
+
+	# Expected Closure Date on non-lost deals (drives forecasted revenue).
+	non_lost_with_expected_close = _populated(
+		Deal.expected_closure_date.isnotnull(), Status.type != "Lost"
+	)
+	fields.append(
+		{
+			"field": _("Expected Closure Date (non-Lost)"),
+			"populated_pct": _pct(non_lost_with_expected_close, non_lost_total),
+			"populated": non_lost_with_expected_close,
+			"total": non_lost_total,
+		}
+	)
+
+	# Linked Lead on all deals in window (drives Avg. Time to Close a Lead).
+	deals_with_lead = _populated(Deal.lead.isnotnull() & (Deal.lead != ""))
+	fields.append(
+		{
+			"field": _("Linked Lead"),
+			"populated_pct": _pct(deals_with_lead, total_deals),
+			"populated": deals_with_lead,
+			"total": total_deals,
+		}
+	)
+
+	# Deal Owner on all deals (drives Deals by Salesperson).
+	deals_with_owner = _populated(Deal.deal_owner.isnotnull() & (Deal.deal_owner != ""))
+	fields.append(
+		{
+			"field": _("Deal Owner"),
+			"populated_pct": _pct(deals_with_owner, total_deals),
+			"populated": deals_with_owner,
+			"total": total_deals,
+		}
+	)
+
+	return {
+		"data": fields,
+		"title": _("Data quality"),
+		"subtitle": _("% of deals with each dashboard-relevant field set (current window)"),
+		"xAxis": {
+			"title": _("Field"),
+			"key": "field",
+			"type": "category",
+		},
+		"yAxis": {
+			"title": _("% populated"),
+		},
+		"series": [
+			{"name": "populated_pct", "type": "bar"},
 		],
 	}
 
