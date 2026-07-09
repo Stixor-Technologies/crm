@@ -373,6 +373,7 @@ import {
   isTranslatable,
 } from '@/utils'
 import { getView } from '@/utils/view'
+import { createDialog } from '@/utils/dialogs'
 import { getSettings } from '@/stores/settings'
 import { globalStore } from '@/stores/global'
 import { statusesStore } from '@/stores/statuses'
@@ -799,16 +800,58 @@ function setLostReason() {
 }
 
 function beforeStatusChange(data) {
-  if (
-    Object.hasOwn(data ?? {}, 'status') &&
-    getDealStatus(data.status).type == 'Lost'
-  ) {
+  const isStatusChange = Object.hasOwn(data ?? {}, 'status')
+  const newType = isStatusChange ? getDealStatus(data.status).type : null
+
+  if (newType == 'Lost') {
     setLostReason()
-  } else {
-    document.save.submit(null, {
-      onSuccess: () => reloadResources(data),
-    })
+    return
   }
+
+  // Warn if marking Won with no value captured on the deal. `expected_deal_value`
+  // is accepted as a stand-in because some teams enter the amount there at pipeline
+  // creation and never re-touch it at close. If either is set, the deal has a value.
+  const hasValue = Number(doc.value?.deal_value) || Number(doc.value?.expected_deal_value)
+  if (newType == 'Won' && !hasValue) {
+    const proceed = () => {
+      document.save.submit(null, { onSuccess: () => reloadResources(data) })
+    }
+    const revert = () => {
+      // Bounce the status back to what it was before the user picked Won.
+      const before = document.doc?.status
+      if (before && before != data.status) doc.value.status = before
+    }
+    createDialog({
+      title: __('Mark deal as Won without a value?'),
+      message: __(
+        'This deal has no Deal Value or Expected Deal Value entered. Won deals with no value distort revenue metrics. Confirm you want to mark it Won anyway?',
+      ),
+      icon: { name: 'alert-triangle', appearance: 'warning' },
+      actions: [
+        {
+          label: __('Cancel'),
+          onClick: ({ close }) => {
+            revert()
+            close()
+          },
+        },
+        {
+          label: __('Mark as Won'),
+          variant: 'solid',
+          theme: 'red',
+          onClick: ({ close }) => {
+            proceed()
+            close()
+          },
+        },
+      ],
+    })
+    return
+  }
+
+  document.save.submit(null, {
+    onSuccess: () => reloadResources(data),
+  })
 }
 
 function reloadResources(data) {
