@@ -89,6 +89,8 @@ const axisChart = ref('sales_trend')
 const axisCharts = [
   { label: __('Sales Trend'), value: 'sales_trend' },
   { label: __('Forecasted Revenue'), value: 'forecasted_revenue' },
+  { label: __('Win Rate Over Time'), value: 'win_rate_trend' },
+  { label: __('Data Quality'), value: 'data_quality' },
   { label: __('Funnel Conversion'), value: 'funnel_conversion' },
   { label: __('Deals by Ongoing & Won Stage'), value: 'deals_by_stage_axis' },
   { label: __('Lost Deal Reasons'), value: 'lost_deal_reasons' },
