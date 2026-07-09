@@ -32,11 +32,14 @@ def _get_currency_context(target_currency: str | None = None) -> dict:
 
 	Rate resolution, in order:
 	  1. If target == base, multiplier is 1.
-	  2. Most recent `Currency Exchange` row with (from=base, to=target).
-	  3. Derived from actual deals — average `exchange_rate` on deals whose `currency`
-	     equals the target (that column holds target -> base, so base -> target = 1/it).
-	     Used when the Currency Exchange doctype hasn't been populated, which is common
-	     when users track FX per-deal instead of maintaining rate rows.
+	  2. erpnext.setup.utils.get_exchange_rate — the framework helper. It reads
+	     `Currency Exchange` rows first, then falls through to the live API configured
+	     in `Currency Exchange Settings` (exchangerate.host / frankfurter / etc.),
+	     caching each response as a new `Currency Exchange` row. This is the intended
+	     path on any site with ERPNext installed and rates configured.
+	  3. Derived from the DB: average of `exchange_rate` on deals whose `currency`
+	     equals target (that column stores target->base, so base->target = 1/it).
+	     Kept as a fallback for sites without ERPNext or with an unreachable rate API.
 	  4. Fallback: 1.0, so the chart still renders (values will read as base).
 	"""
 	base = frappe.db.get_single_value("FCRM Settings", "currency") or "USD"
@@ -47,13 +50,17 @@ def _get_currency_context(target_currency: str | None = None) -> dict:
 	if target == base:
 		return {"code": base, "symbol": symbol_for(base), "multiplier": 1.0}
 
-	rate = frappe.db.get_value(
-		"Currency Exchange",
-		{"from_currency": base, "to_currency": target},
-		"exchange_rate",
-		order_by="date desc",
-	)
-	rate = float(rate) if rate else None
+	rate: float | None = None
+
+	try:
+		from erpnext.setup.utils import get_exchange_rate
+
+		rate = get_exchange_rate(base, target)
+		rate = float(rate) if rate else None
+	except Exception:
+		# ImportError (ERPNext not installed) or a transient API failure — either way,
+		# fall through to the deal-average heuristic below rather than 500-ing the dashboard.
+		rate = None
 
 	if not rate:
 		row = frappe.db.sql(
