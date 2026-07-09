@@ -321,60 +321,34 @@ def get_total_leads(from_date: str | None = None, to_date: str | None = None, us
 
 def get_ongoing_deals(from_date: str | None = None, to_date: str | None = None, user: str | None = None):
 	"""
-	Get ongoing deal count for the dashboard, and also calculate average deal value for ongoing deals.
+	Snapshot: how many deals are currently non-terminal (Open / Ongoing).
+
+	Ignores from_date/to_date. "Ongoing" is fundamentally a snapshot — the tile
+	reads as "how big is my pipeline right now", not "how many did I create in
+	this window that are still open". The original creation-in-window filter
+	silently dropped every deal opened before the window, so a slow month showed
+	0 ongoing deals even when the real pipeline had 12+. User filter still applies.
 	"""
-	diff = frappe.utils.date_diff(to_date, from_date)
-	if diff == 0:
-		diff = 1
-
-	prev_from_date = frappe.utils.add_days(from_date, -diff)
-	to_date_plus_one = frappe.utils.add_days(to_date, 1)
-
 	Deal = DocType("CRM Deal")
 	Status = DocType("CRM Deal Status")
 
-	# Build conditions for current period
-	current_cond = (
-		(Deal.creation >= from_date)
-		& (Deal.creation < to_date_plus_one)
-		& (Status.type.notin(["Won", "Lost"]))
-	)
-	if user:
-		current_cond = current_cond & (Deal.deal_owner == user)
-
-	# Build conditions for previous period
-	prev_cond = (
-		(Deal.creation >= prev_from_date) & (Deal.creation < from_date) & (Status.type.notin(["Won", "Lost"]))
-	)
-	if user:
-		prev_cond = prev_cond & (Deal.deal_owner == user)
-
-	# Build query with CASE expressions
 	query = (
 		frappe.qb.from_(Deal)
 		.join(Status)
 		.on(Deal.status == Status.name)
-		.select(
-			Count(Case().when(current_cond, Deal.name).else_(None)).as_("current_month_deals"),
-			Count(Case().when(prev_cond, Deal.name).else_(None)).as_("prev_month_deals"),
-		)
+		.where(Status.type.notin(["Won", "Lost"]))
+		.select(Count("*").as_("ongoing"))
 	)
+	if user:
+		query = query.where(Deal.deal_owner == user)
 
 	result = query.run(as_dict=True)
-
-	current_month_deals = result[0].current_month_deals or 0
-	prev_month_deals = result[0].prev_month_deals or 0
-
-	delta_in_percentage = (
-		(current_month_deals - prev_month_deals) / prev_month_deals * 100 if prev_month_deals else 0
-	)
+	ongoing = int(result[0]["ongoing"] or 0)
 
 	return {
 		"title": _("Ongoing deals"),
-		"tooltip": _("Total number of non won/lost deals"),
-		"value": current_month_deals,
-		"delta": delta_in_percentage,
-		"deltaSuffix": "%",
+		"tooltip": _("Deals currently in a non-Won/Lost status (snapshot, ignores date filter)"),
+		"value": ongoing,
 	}
 
 
@@ -382,63 +356,37 @@ def get_average_ongoing_deal_value(
 	from_date: str | None = None, to_date: str | None = None, user: str | None = None
 ):
 	"""
-	Get ongoing deal count for the dashboard, and also calculate average deal value for ongoing deals.
+	Snapshot: average `deal_value` across deals currently in a non-terminal status.
+
+	Ignores from_date/to_date for the same reason as `get_ongoing_deals` — this
+	tile is about the current pipeline, not what was opened in a window. NULL
+	average (i.e. no non-terminal deals, or none with a value entered) sets
+	isEmpty so the frontend renders "—".
 	"""
-	diff = frappe.utils.date_diff(to_date, from_date)
-	if diff == 0:
-		diff = 1
-
-	prev_from_date = frappe.utils.add_days(from_date, -diff)
-	to_date_plus_one = frappe.utils.add_days(to_date, 1)
-
 	Deal = DocType("CRM Deal")
 	Status = DocType("CRM Deal Status")
 
-	# Build conditions for current period
-	current_cond = (
-		(Deal.creation >= from_date)
-		& (Deal.creation < to_date_plus_one)
-		& (Status.type.notin(["Won", "Lost"]))
-	)
-	if user:
-		current_cond = current_cond & (Deal.deal_owner == user)
-
-	# Build conditions for previous period
-	prev_cond = (
-		(Deal.creation >= prev_from_date) & (Deal.creation < from_date) & (Status.type.notin(["Won", "Lost"]))
-	)
-	if user:
-		prev_cond = prev_cond & (Deal.deal_owner == user)
-
-	# Calculate deal value with exchange rate
 	deal_value_expr = Deal.deal_value * IfNull(Deal.exchange_rate, 1)
 
-	# Build query with CASE expressions
 	query = (
 		frappe.qb.from_(Deal)
 		.join(Status)
 		.on(Deal.status == Status.name)
-		.select(
-			Avg(Case().when(current_cond, deal_value_expr).else_(None)).as_("current_month_avg_value"),
-			Avg(Case().when(prev_cond, deal_value_expr).else_(None)).as_("prev_month_avg_value"),
-		)
+		.where(Status.type.notin(["Won", "Lost"]))
+		.select(Avg(deal_value_expr).as_("avg_value"))
 	)
+	if user:
+		query = query.where(Deal.deal_owner == user)
 
 	result = query.run(as_dict=True)
-
-	current_month_avg_value = result[0].current_month_avg_value
-	prev_month_avg_value = result[0].prev_month_avg_value
-	is_empty = not current_month_avg_value
-	current_month_avg_value = current_month_avg_value or 0
-	prev_month_avg_value = prev_month_avg_value or 0
-
-	avg_value_delta = current_month_avg_value - prev_month_avg_value if prev_month_avg_value else 0
+	avg_value = result[0].avg_value
+	is_empty = not avg_value
+	avg_value = float(avg_value or 0)
 
 	return {
 		"title": _("Avg. ongoing deal value"),
-		"tooltip": _("Average deal value of non won/lost deals"),
-		"value": current_month_avg_value,
-		"delta": avg_value_delta,
+		"tooltip": _("Average deal_value across currently ongoing deals (snapshot, ignores date filter)"),
+		"value": avg_value,
 		"prefix": get_base_currency_symbol(),
 		"isEmpty": is_empty,
 		"emptyReason": _("No ongoing deals with a value entered"),
