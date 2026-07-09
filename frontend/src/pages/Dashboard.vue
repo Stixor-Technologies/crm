@@ -115,6 +115,18 @@
           </Tooltip>
         </template>
       </Link>
+      <Dropdown
+        v-if="currencyOptions.length > 1"
+        :options="currencyOptions"
+        class="form-control"
+        :button="{
+          label: filters.currency || defaultCurrency,
+          class:
+            '!w-full justify-start [&>span]:mr-auto [&>svg]:text-ink-gray-5',
+          variant: 'outline',
+          iconRight: 'chevron-down',
+        }"
+      />
     </div>
 
     <div class="w-full overflow-y-scroll">
@@ -164,10 +176,18 @@ const datePickerRef = ref(null)
 const preset = ref('Last 30 Days')
 const showAddChartModal = ref(false)
 
+// Currency choice is persisted per-browser so the dashboard remembers what the user
+// picked last time. Null means "use the base currency configured in FCRM Settings",
+// which is what the backend does when currency is omitted.
+const CURRENCY_STORAGE_KEY = 'crm-dashboard-currency'
+
 const filters = reactive({
   period: getLastXDays(),
   user: null,
+  currency: (typeof window !== 'undefined' && window.localStorage.getItem(CURRENCY_STORAGE_KEY)) || null,
 })
+
+const defaultCurrency = ref('')  // populated from list_dashboard_currencies once loaded
 
 const fromDate = computed(() => {
   if (!filters.period) return null
@@ -242,9 +262,41 @@ const dashboardItems = createResource({
       from_date: fromDate.value,
       to_date: toDate.value,
       user: filters.user,
+      currency: filters.currency,
     }
   },
   auto: true,
+})
+
+// Fetch the list of currencies the picker should show (base + any currency seen on a deal).
+// `list_dashboard_currencies` is cheap — a single indexed query — so we let it fire on mount.
+const currencies = createResource({
+  url: 'crm.api.dashboard.list_dashboard_currencies',
+  auto: true,
+  onSuccess: (data) => {
+    const base = data?.find((c) => c.isBase)
+    defaultCurrency.value = base?.code || ''
+  },
+})
+
+const currencyOptions = computed(() => {
+  const rows = currencies.data || []
+  return rows.map((c) => ({
+    label: `${c.code}${c.symbol && c.symbol !== c.code ? ' (' + c.symbol + ')' : ''}${
+      c.isBase ? ' — ' + __('base') : ''
+    }`,
+    onClick: () => {
+      filters.currency = c.isBase ? null : c.code
+      if (typeof window !== 'undefined') {
+        if (filters.currency) {
+          window.localStorage.setItem(CURRENCY_STORAGE_KEY, filters.currency)
+        } else {
+          window.localStorage.removeItem(CURRENCY_STORAGE_KEY)
+        }
+      }
+      dashboardItems.reload()
+    },
+  }))
 })
 
 const dirty = computed(() => {

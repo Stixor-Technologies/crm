@@ -1,4 +1,5 @@
 import json
+import re
 
 import frappe
 from frappe import _
@@ -16,6 +17,104 @@ class TimestampDiff(Function):
 		super().__init__("TIMESTAMPDIFF", unit, start, end, **kwargs)
 
 
+# Row-level dict keys treated as currency amounts by `_apply_currency`. Kept as a small
+# closed set so we don't inadvertently convert count/percent fields that happen to be numeric.
+_CURRENCY_ROW_KEYS = ("value", "forecasted", "actual")
+
+
+def _get_currency_context(target_currency: str | None = None) -> dict:
+	"""
+	Resolve the currency the dashboard should display in.
+
+	Returns {code, symbol, multiplier}, where `multiplier` converts a value already
+	normalized to the base currency (via each deal's stored `exchange_rate`) into the
+	target currency.
+
+	Rate resolution, in order:
+	  1. If target == base, multiplier is 1.
+	  2. Most recent `Currency Exchange` row with (from=base, to=target).
+	  3. Derived from actual deals — average `exchange_rate` on deals whose `currency`
+	     equals the target (that column holds target -> base, so base -> target = 1/it).
+	     Used when the Currency Exchange doctype hasn't been populated, which is common
+	     when users track FX per-deal instead of maintaining rate rows.
+	  4. Fallback: 1.0, so the chart still renders (values will read as base).
+	"""
+	base = frappe.db.get_single_value("FCRM Settings", "currency") or "USD"
+	target = target_currency or base
+
+	symbol_for = lambda code: frappe.db.get_value("Currency", code, "symbol") or code
+
+	if target == base:
+		return {"code": base, "symbol": symbol_for(base), "multiplier": 1.0}
+
+	rate = frappe.db.get_value(
+		"Currency Exchange",
+		{"from_currency": base, "to_currency": target},
+		"exchange_rate",
+		order_by="date desc",
+	)
+	rate = float(rate) if rate else None
+
+	if not rate:
+		row = frappe.db.sql(
+			"""
+			SELECT AVG(exchange_rate) FROM `tabCRM Deal`
+			WHERE currency = %s AND exchange_rate > 0
+			""",
+			target,
+		)
+		avg_target_to_base = row[0][0] if row and row[0] else None
+		if avg_target_to_base:
+			rate = 1.0 / float(avg_target_to_base)
+
+	if not rate:
+		rate = 1.0
+
+	return {"code": target, "symbol": symbol_for(target), "multiplier": rate}
+
+
+def _apply_currency(data: dict | list | None, ctx: dict) -> dict | list | None:
+	"""
+	Rewrite a chart payload so its currency-bearing values render in the target currency.
+
+	- Replaces `prefix` (number chart) with the target symbol.
+	- Multiplies top-level `value` and any row-level `_CURRENCY_ROW_KEYS` by `ctx['multiplier']`.
+	- Rewrites any "(<symbol>)" tail in yAxis / y2Axis titles so labels match the shown units.
+	No-op when ctx['multiplier'] is 1.0 and the prefix already matches — but we still walk to
+	catch the axis-title case where a user picks their own base currency explicitly.
+	"""
+	if not isinstance(data, dict):
+		return data
+
+	multiplier = ctx["multiplier"]
+	symbol = ctx["symbol"]
+
+	if "prefix" in data:
+		data["prefix"] = symbol
+
+	if isinstance(data.get("value"), int | float):
+		data["value"] = data["value"] * multiplier
+
+	# Only touch axis titles that already carry a "(symbol)" tail, and only the tail —
+	# leaves the axis label alone (e.g. "Revenue (₨)" -> "Revenue ($)").
+	title_currency_pattern = re.compile(r"\([^)]*\)$")
+	for axis in ("yAxis", "y2Axis"):
+		axis_conf = data.get(axis)
+		if isinstance(axis_conf, dict) and isinstance(axis_conf.get("title"), str):
+			axis_conf["title"] = title_currency_pattern.sub(f"({symbol})", axis_conf["title"])
+
+	rows = data.get("data")
+	if isinstance(rows, list):
+		for row in rows:
+			if not isinstance(row, dict):
+				continue
+			for key in _CURRENCY_ROW_KEYS:
+				if isinstance(row.get(key), int | float):
+					row[key] = row[key] * multiplier
+
+	return data
+
+
 @frappe.whitelist()
 def reset_to_default():
 	frappe.only_for("System Manager", True)
@@ -24,7 +123,12 @@ def reset_to_default():
 
 @frappe.whitelist()
 @sales_user_only
-def get_dashboard(from_date: str | None = None, to_date: str | None = None, user: str | None = None):
+def get_dashboard(
+	from_date: str | None = None,
+	to_date: str | None = None,
+	user: str | None = None,
+	currency: str | None = None,
+):
 	"""
 	Get the dashboard data for the CRM dashboard.
 	"""
@@ -50,11 +154,13 @@ def get_dashboard(from_date: str | None = None, to_date: str | None = None, user
 	else:
 		layout = json.loads(frappe.db.get_value("CRM Dashboard", "Manager Dashboard", "layout") or "[]")
 
+	currency_ctx = _get_currency_context(currency)
+
 	for l in layout:
 		method_name = f"get_{l['name']}"
 		if hasattr(frappe.get_attr("crm.api.dashboard"), method_name):
 			method = getattr(frappe.get_attr("crm.api.dashboard"), method_name)
-			l["data"] = method(from_date, to_date, user)
+			l["data"] = _apply_currency(method(from_date, to_date, user), currency_ctx)
 		else:
 			l["data"] = None
 
@@ -64,7 +170,12 @@ def get_dashboard(from_date: str | None = None, to_date: str | None = None, user
 @frappe.whitelist()
 @sales_user_only
 def get_chart(
-	name: str, type: str, from_date: str | None = None, to_date: str | None = None, user: str | None = None
+	name: str,
+	type: str,
+	from_date: str | None = None,
+	to_date: str | None = None,
+	user: str | None = None,
+	currency: str | None = None,
 ):
 	"""
 	Get number chart data for the dashboard.
@@ -83,9 +194,32 @@ def get_chart(
 	method_name = f"get_{name}"
 	if hasattr(frappe.get_attr("crm.api.dashboard"), method_name):
 		method = getattr(frappe.get_attr("crm.api.dashboard"), method_name)
-		return method(from_date, to_date, user)
+		return _apply_currency(method(from_date, to_date, user), _get_currency_context(currency))
 	else:
 		return {"error": _("Invalid chart name")}
+
+
+@frappe.whitelist()
+@sales_user_only
+def list_dashboard_currencies() -> list[dict]:
+	"""
+	Currencies offered in the dashboard currency picker.
+
+	Returns the base currency plus any other currency that appears on at least one deal.
+	Order: base first, then alphabetical.
+	"""
+	base = frappe.db.get_single_value("FCRM Settings", "currency") or "USD"
+
+	seen = frappe.db.sql_list(
+		"SELECT DISTINCT currency FROM `tabCRM Deal` WHERE currency IS NOT NULL AND currency != ''"
+	)
+	seen = set(seen) | {base}
+
+	rows = []
+	for code in sorted(seen, key=lambda c: (c != base, c)):
+		symbol = frappe.db.get_value("Currency", code, "symbol") or code
+		rows.append({"code": code, "symbol": symbol, "isBase": code == base})
+	return rows
 
 
 def get_total_leads(from_date: str | None = None, to_date: str | None = None, user: str | None = None):
