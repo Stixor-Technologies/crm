@@ -22,6 +22,32 @@ class TimestampDiff(Function):
 _CURRENCY_ROW_KEYS = ("value", "forecasted", "actual")
 
 
+def _apply_empty_state(data: dict | list | None) -> dict | list | None:
+	"""
+	Mark axis/donut chart payloads with `isEmpty` when they have no rows to render.
+
+	Number-chart tiles already set their own `isEmpty` at the metric level (they know
+	whether the SQL AVG/SUM returned NULL). Axis and donut charts don't — an empty
+	`data` list renders as an empty axis or a blank donut, which reads as "broken
+	chart" instead of "no qualifying data".
+
+	The frontend uses `isEmpty` to render a "—" placeholder with the emptyReason as a
+	tooltip, matching the number-chart empty state.
+	"""
+	if not isinstance(data, dict):
+		return data
+	# Respect explicit isEmpty already set by the metric function.
+	if data.get("isEmpty") is not None:
+		return data
+	rows = data.get("data")
+	if isinstance(rows, list) and len(rows) == 0:
+		data["isEmpty"] = True
+		data["emptyReason"] = data.get("emptyReason") or _(
+			"No qualifying data in this window"
+		)
+	return data
+
+
 def _get_currency_context(target_currency: str | None = None) -> dict:
 	"""
 	Resolve the currency the dashboard should display in.
@@ -180,7 +206,9 @@ def get_dashboard(
 		method_name = f"get_{l['name']}"
 		if hasattr(frappe.get_attr("crm.api.dashboard"), method_name):
 			method = getattr(frappe.get_attr("crm.api.dashboard"), method_name)
-			l["data"] = _apply_currency(method(from_date, to_date, user), currency_ctx)
+			l["data"] = _apply_empty_state(
+				_apply_currency(method(from_date, to_date, user), currency_ctx)
+			)
 		else:
 			l["data"] = None
 
@@ -214,7 +242,9 @@ def get_chart(
 	method_name = f"get_{name}"
 	if hasattr(frappe.get_attr("crm.api.dashboard"), method_name):
 		method = getattr(frappe.get_attr("crm.api.dashboard"), method_name)
-		return _apply_currency(method(from_date, to_date, user), _get_currency_context(currency))
+		return _apply_empty_state(
+			_apply_currency(method(from_date, to_date, user), _get_currency_context(currency))
+		)
 	else:
 		return {"error": _("Invalid chart name")}
 
@@ -1088,18 +1118,13 @@ def get_deals_by_stage_donut(
 
 def get_lost_deal_reasons(from_date: str | None = None, to_date: str | None = None, user: str | None = None):
 	"""
-	Get lost deal reasons for the dashboard.
-	[
-		{ reason: 'Price too high', count: 20 },
-		{ reason: 'Competitor won', count: 15 },
-		...
-	]
-	"""
-	if not from_date or not to_date:
-		from_date = frappe.utils.get_first_day(from_date or frappe.utils.nowdate())
-		to_date = frappe.utils.get_last_day(to_date or frappe.utils.nowdate())
+	Lost deal reasons across all deals.
 
-	# Using Frappe Query Builder with JOIN
+	Ignores from_date/to_date. This is a *pattern discovery* metric — you want to
+	know which reasons keep coming up, and a period-scoped view suppresses the ones
+	that hurt you consistently but only fire once or twice a quarter. All-time is
+	the meaningful scope. User filter still applies.
+	"""
 	CRMDeal = DocType("CRM Deal")
 	CRMDealStatus = DocType("CRM Deal Status")
 
@@ -1108,7 +1133,7 @@ def get_lost_deal_reasons(from_date: str | None = None, to_date: str | None = No
 		.join(CRMDealStatus)
 		.on(CRMDeal.status == CRMDealStatus.name)
 		.select(CRMDeal.lost_reason.as_("reason"), Count("*").as_("count"))
-		.where((Date(CRMDeal.creation).between(from_date, to_date)) & (CRMDealStatus.type == "Lost"))
+		.where(CRMDealStatus.type == "Lost")
 		.groupby(CRMDeal.lost_reason)
 		.having((CRMDeal.lost_reason.isnotnull()) & (CRMDeal.lost_reason != ""))
 		.orderby(Count("*"), order=frappe.qb.desc)
@@ -1122,7 +1147,7 @@ def get_lost_deal_reasons(from_date: str | None = None, to_date: str | None = No
 	return {
 		"data": result or [],
 		"title": _("Lost deal reasons"),
-		"subtitle": _("Common reasons for losing deals"),
+		"subtitle": _("All-time — common reasons for losing deals"),
 		"xAxis": {
 			"title": _("Reason"),
 			"key": "reason",
@@ -1421,34 +1446,26 @@ def get_data_quality(
 ):
 	"""
 	Data-quality snapshot: for each dashboard-relevant deal field, the percentage of
-	deals in the current window that have it populated.
+	deals that have it populated.
+
+	Ignores from_date/to_date on purpose. Data quality is a *discipline* metric — it
+	measures your team's ongoing fill-in habits, not a period snapshot. Applying the
+	global window makes the percentages arbitrary (small window -> small denominator,
+	one missing field reads as 0% or 100%, no signal). All-time is the meaningful
+	scope. The user filter still applies so a manager can scope to one salesperson.
 
 	Purpose is to make the reason behind empty tiles visible. E.g. Avg. Won Deal
-	Value at 0 could be zero because there are no won deals in the period, or
-	because won deals were closed without a `deal_value` — this chart tells you
-	which. Bar per field with % populated (0-100).
+	Value at 0 could be zero because there are no won deals, or because won deals
+	were closed without a `deal_value` — this chart tells you which.
 	"""
-	if not from_date or not to_date:
-		from_date = frappe.utils.get_first_day(from_date or frappe.utils.nowdate())
-		to_date = frappe.utils.get_last_day(to_date or frappe.utils.nowdate())
-
-	to_date_plus_one = frappe.utils.add_days(to_date, 1)
-
 	Deal = DocType("CRM Deal")
 	Status = DocType("CRM Deal Status")
 
 	user_cond = (Deal.deal_owner == user) if user else None
 
 	def _run(where_extra=None):
-		"""Return (total, populated_field_counts) for deals matching the window."""
-		# Base filter: deals created in the current period (matches the rest of the dashboard).
-		q = (
-			frappe.qb.from_(Deal)
-			.join(Status)
-			.on(Deal.status == Status.name)
-			.where(Deal.creation >= from_date)
-			.where(Deal.creation < to_date_plus_one)
-		)
+		"""Return a query over all deals matching the user filter (no date scope)."""
+		q = frappe.qb.from_(Deal).join(Status).on(Deal.status == Status.name)
 		if user_cond is not None:
 			q = q.where(user_cond)
 		if where_extra is not None:
@@ -1470,7 +1487,10 @@ def get_data_quality(
 	won_total = int(won_query.run(as_dict=True)[0]["n"])
 
 	def _pct(numer, denom):
-		return round(100.0 * numer / denom, 1) if denom else 0.0
+		# Return None (not 0) when there's nothing to divide — the frontend renders
+		# that as "N/A" instead of a misleading 0% bar. A 0/0 field-fill rate is
+		# undefined; showing "0%" would read as "team is failing at this field".
+		return round(100.0 * numer / denom, 1) if denom else None
 
 	fields = []
 
