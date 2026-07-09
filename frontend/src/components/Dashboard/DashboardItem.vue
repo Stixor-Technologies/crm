@@ -35,13 +35,37 @@
       v-else-if="item.type == 'axis_chart'"
       class="h-full w-full rounded-md bg-surface-base shadow"
     >
-      <AxisChart v-if="item.data" :config="item.data" />
+      <div
+        v-if="item.data?.isEmpty"
+        class="flex h-full w-full flex-col items-center justify-center gap-1 px-6 text-center"
+      >
+        <div class="text-sm-medium text-ink-gray-5">
+          {{ item.data.title }}
+        </div>
+        <div class="text-[24px] font-semibold text-ink-gray-4 leading-none">—</div>
+        <div class="text-xs text-ink-gray-5">
+          {{ item.data.emptyReason || __('No data in this window') }}
+        </div>
+      </div>
+      <AxisChart v-else-if="item.data" :config="item.data" />
     </div>
     <div
       v-else-if="item.type == 'donut_chart'"
       class="h-full w-full rounded-md bg-surface-base shadow overflow-hidden"
     >
-      <DonutChart v-if="item.data" :config="item.data" />
+      <div
+        v-if="item.data?.isEmpty"
+        class="flex h-full w-full flex-col items-center justify-center gap-1 px-6 text-center"
+      >
+        <div class="text-sm-medium text-ink-gray-5">
+          {{ item.data.title }}
+        </div>
+        <div class="text-[24px] font-semibold text-ink-gray-4 leading-none">—</div>
+        <div class="text-xs text-ink-gray-5">
+          {{ item.data.emptyReason || __('No data in this window') }}
+        </div>
+      </div>
+      <DonutChart v-else-if="item.data" :config="item.data" />
     </div>
   </div>
 </template>
