@@ -119,11 +119,15 @@ def _apply_currency(data: dict | list | None, ctx: dict) -> dict | list | None:
 	"""
 	Rewrite a chart payload so its currency-bearing values render in the target currency.
 
-	- Replaces `prefix` (number chart) with the target symbol.
-	- Multiplies top-level `value` and any row-level `_CURRENCY_ROW_KEYS` by `ctx['multiplier']`.
-	- Rewrites any "(<symbol>)" tail in yAxis / y2Axis titles so labels match the shown units.
-	No-op when ctx['multiplier'] is 1.0 and the prefix already matches — but we still walk to
-	catch the axis-title case where a user picks their own base currency explicitly.
+	Number-chart tiles are treated as currency-bearing iff they declare a `prefix`.
+	Counts (ongoing_deals, won_deals, total_leads) have no prefix; scaling their
+	`value` by the FX multiplier would turn `12` into `0.043` under USD and render
+	as 0 on the tile. So the top-level `value` gets multiplied only when a prefix
+	is present.
+
+	Row-level values are keyed to `_CURRENCY_ROW_KEYS` so count/percent row fields
+	aren't touched either. Axis titles are rewritten only when they carry the base
+	symbol in parens (guarded separately below), so `Win rate (%)` stays untouched.
 	"""
 	if not isinstance(data, dict):
 		return data
@@ -131,11 +135,11 @@ def _apply_currency(data: dict | list | None, ctx: dict) -> dict | list | None:
 	multiplier = ctx["multiplier"]
 	symbol = ctx["symbol"]
 
-	if "prefix" in data:
+	is_currency_tile = "prefix" in data
+	if is_currency_tile:
 		data["prefix"] = symbol
-
-	if isinstance(data.get("value"), int | float):
-		data["value"] = data["value"] * multiplier
+		if isinstance(data.get("value"), int | float):
+			data["value"] = data["value"] * multiplier
 
 	# Only rewrite axis titles that carry the *base* currency symbol in parens — this
 	# leaves unrelated parenthetical suffixes (like "Win rate (%)") untouched. Charts
