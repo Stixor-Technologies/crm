@@ -1,0 +1,25 @@
+# Notify frappe-infra that this app moved, so it builds + deploys staging immediately
+# instead of waiting for its 30-minute poll. Skips cleanly if INFRA_DISPATCH_TOKEN is not
+# set (repo secret: a fine-grained PAT with "Contents: read & write" on
+# Stixor-Technologies/frappe-infra). See frappe-infra/docs/app-repo-dispatch.yml.
+name: notify-infra
+on:
+  push:
+    branches: [main]
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
+    steps:
+      - name: Trigger frappe-infra build
+        if: env.TOKEN != ''
+        run: |
+          curl -fsS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TOKEN" \
+            https://api.github.com/repos/Stixor-Technologies/frappe-infra/dispatches \
+            -d "{\"event_type\":\"app-updated\",\"client_payload\":{\"repo\":\"${{ github.repository }}\",\"sha\":\"${{ github.sha }}\"}}"
+      - name: No token configured
+        if: env.TOKEN == ''
+        run: echo "INFRA_DISPATCH_TOKEN not set; frappe-infra will pick this up on its next 30-minute poll."
