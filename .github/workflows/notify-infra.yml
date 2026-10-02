@@ -1,7 +1,11 @@
-# Notify frappe-infra that this app moved, so it builds + deploys staging immediately
-# instead of waiting for its 30-minute poll. Skips cleanly if INFRA_DISPATCH_TOKEN is not
-# set (repo secret: a fine-grained PAT with "Contents: read & write" on
-# Stixor-Technologies/frappe-infra). See frappe-infra/docs/app-repo-dispatch.yml.
+# Notify frappe-infra that this app moved, so it builds + deploys staging immediately instead of
+# waiting for the weekly safety-net poll. Skips cleanly if INFRA_DISPATCH_TOKEN is not set
+# (repo secret: a fine-grained PAT with "Contents: read & write" on Stixor-Technologies/frappe-infra).
+#
+# `branches` MUST be the branch frappe-infra/apps.json tracks for this repo — anything else is a
+# wasted run (frappe-infra compares the apps fingerprint and does nothing, but the run itself
+# still bills a minute on both sides). Today: hrms -> develop; crm, frappe-slack-connector -> main.
+# Installed in all three forks as .github/workflows/notify-infra.yml; keep them in sync with this file.
 name: notify-infra
 on:
   push:
@@ -9,6 +13,7 @@ on:
 jobs:
   dispatch:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     env:
       TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
     steps:
@@ -22,4 +27,4 @@ jobs:
             -d "{\"event_type\":\"app-updated\",\"client_payload\":{\"repo\":\"${{ github.repository }}\",\"sha\":\"${{ github.sha }}\"}}"
       - name: No token configured
         if: env.TOKEN == ''
-        run: echo "INFRA_DISPATCH_TOKEN not set; frappe-infra will pick this up on its next 30-minute poll."
+        run: echo "INFRA_DISPATCH_TOKEN not set; frappe-infra will pick this up on its weekly poll (Monday 03:00 UTC) or a manual run."
