@@ -1600,9 +1600,9 @@ def get_aging_deals(
 			"title": _("Deals stuck"),
 		},
 		"series": [
-			{"name": "d30_60", "type": "bar", "stack": "aging"},
-			{"name": "d60_90", "type": "bar", "stack": "aging"},
-			{"name": "d90_plus", "type": "bar", "stack": "aging"},
+			{"name": "d30_60", "type": "bar", "stackName": "aging"},
+			{"name": "d60_90", "type": "bar", "stackName": "aging"},
+			{"name": "d90_plus", "type": "bar", "stackName": "aging"},
 		],
 	}
 

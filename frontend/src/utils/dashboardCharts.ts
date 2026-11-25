@@ -63,16 +63,20 @@ export interface DonutChartConfig {
 
 export type NumberChartConfig = NumberCardProps & { tooltip?: string }
 
+// isEmpty/emptyReason: set by the dashboard API when a chart has nothing to show
+// in the chosen window; DashboardItem renders "—" with the reason instead.
 export type DashboardChartConfig = Partial<
   NumberChartConfig & AxisChartConfig & DonutChartConfig
->
+> & { isEmpty?: boolean; emptyReason?: string }
 
 export type AxisChartKind = 'line' | 'area' | 'bar'
 
 export function toNumberCardProps(config: NumberChartConfig): NumberCardProps {
-  const props = { ...config }
+  const props: Row = { ...config }
   delete props.tooltip
-  return props
+  delete props.isEmpty
+  delete props.emptyReason
+  return props as NumberCardProps
 }
 
 export function toDonutChartProps(config: DonutChartConfig): DonutChartProps {

@@ -4,9 +4,19 @@
       v-if="item.type == 'number_chart'"
       class="flex h-full w-full overflow-hidden cursor-pointer"
     >
-      <Tooltip :text="__(item.data.tooltip)">
+      <Tooltip
+        :text="__(item.data?.isEmpty ? item.data.emptyReason : item.data?.tooltip)"
+      >
+        <!-- No data for this tile in the chosen window: show "—" rather than a misleading 0 -->
+        <div
+          v-if="item.data?.isEmpty"
+          class="flex h-full w-full flex-col justify-center gap-1 rounded-md bg-surface-base px-4 shadow"
+        >
+          <div class="truncate text-sm text-ink-gray-5">{{ item.data.title }}</div>
+          <div class="text-[24px] font-semibold leading-10 text-ink-gray-4">—</div>
+        </div>
         <NumberCard
-          v-if="item.data"
+          v-else-if="item.data"
           :key="index"
           class="h-full"
           v-bind="numberCardProps"
@@ -21,14 +31,38 @@
       {{ editing ? __('Spacer') : '' }}
     </div>
     <ChartCard v-else-if="item.type == 'axis_chart'" class="h-full">
+      <div
+        v-if="item.data?.isEmpty"
+        class="flex h-full w-full flex-col items-center justify-center gap-1 px-6 text-center"
+      >
+        <div class="text-sm-medium text-ink-gray-5">
+          {{ item.data.title }}
+        </div>
+        <div class="text-[24px] font-semibold text-ink-gray-4 leading-none">—</div>
+        <div class="text-xs text-ink-gray-5">
+          {{ item.data.emptyReason || __('No data in this window') }}
+        </div>
+      </div>
       <component
         :is="axisChart.component"
-        v-if="item.data"
+        v-else-if="item.data"
         v-bind="axisChart.props"
       />
     </ChartCard>
     <ChartCard v-else-if="item.type == 'donut_chart'" class="h-full">
-      <DonutChart v-if="item.data" v-bind="donutChartProps" />
+      <div
+        v-if="item.data?.isEmpty"
+        class="flex h-full w-full flex-col items-center justify-center gap-1 px-6 text-center"
+      >
+        <div class="text-sm-medium text-ink-gray-5">
+          {{ item.data.title }}
+        </div>
+        <div class="text-[24px] font-semibold text-ink-gray-4 leading-none">—</div>
+        <div class="text-xs text-ink-gray-5">
+          {{ item.data.emptyReason || __('No data in this window') }}
+        </div>
+      </div>
+      <DonutChart v-else-if="item.data" v-bind="donutChartProps" />
     </ChartCard>
   </div>
 </template>
